@@ -23,6 +23,11 @@ from PIL import Image, ImageOps, ImageTk
 import updater
 
 try:
+    from send2trash import send2trash
+except ImportError:  # 없으면 원본 삭제 옵션을 비활성화
+    send2trash = None
+
+try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
 except ImportError:
@@ -147,23 +152,25 @@ def open_folder(path: Path):
 
 
 # ---------------------------------------------------------------- 이미지 처리
-def encode(im: Image.Image, fmt: str, **kw) -> bytes:
+def encode(im: Image.Image, fmt: str, exif: bytes | None = None, **kw) -> bytes:
     buf = io.BytesIO()
+    if exif:
+        kw["exif"] = exif
     im.save(buf, fmt, **kw)
     return buf.getvalue()
 
 
-def fit_jpeg(im: Image.Image, limit: int) -> tuple[bytes, tuple[int, int]]:
+def fit_jpeg(im: Image.Image, limit: int, exif: bytes | None = None) -> tuple[bytes, tuple[int, int]]:
     """limit(byte) 이하가 되도록 품질을 이진 탐색하고, 품질 30으로도 크면 해상도를 줄인다."""
     while True:
-        best = encode(im, "JPEG", quality=30, optimize=True)
+        best = encode(im, "JPEG", exif, quality=30, optimize=True)
         if len(best) <= limit or min(im.size) < 64:
             break
         im = im.resize((int(im.width * 0.85), int(im.height * 0.85)), Image.LANCZOS)
     lo, hi = 30, 95
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        data = encode(im, "JPEG", quality=mid, optimize=True)
+        data = encode(im, "JPEG", exif, quality=mid, optimize=True)
         if len(data) <= limit:
             lo, best = mid, data
         else:
@@ -171,11 +178,50 @@ def fit_jpeg(im: Image.Image, limit: int) -> tuple[bytes, tuple[int, int]]:
     return best, im.size
 
 
+def build_exif(im: Image.Image, created: float) -> bytes | None:
+    """원본 EXIF를 유지하되(회전 정보·크기 태그 제외) 촬영일(생성일)이 반드시 들어가게 한다."""
+    try:
+        ex = im.getexif()
+        for tag in (274, 256, 257):  # Orientation(이미 반영됨), ImageWidth/Length
+            ex.pop(tag, None)
+        sub = ex.get_ifd(0x8769)
+        for tag in (40962, 40963):  # PixelXDimension/YDimension
+            sub.pop(tag, None)
+        stamp = datetime.fromtimestamp(created).strftime("%Y:%m:%d %H:%M:%S")
+        for tag in (36867, 36868):  # DateTimeOriginal / DateTimeDigitized
+            sub.setdefault(tag, stamp)
+        ex.setdefault(306, stamp)  # DateTime
+        return ex.tobytes()
+    except Exception:  # noqa: BLE001 - EXIF가 깨져 있어도 리사이즈는 진행
+        return None
+
+
+def set_file_times(path: Path, ts: float):
+    """파일 수정/생성 시각을 원본 생성일로 맞춘다 (EXIF가 없는 환경의 정렬 보조)."""
+    os.utime(path, (ts, ts))  # macOS는 수정일을 과거로 돌리면 생성일도 함께 내려간다
+    if WIN:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            k32.CreateFileW.restype = wintypes.HANDLE
+            h = k32.CreateFileW(str(path), 0x100, 0, None, 3, 0x80, None)  # FILE_WRITE_ATTRIBUTES
+            if h and h != wintypes.HANDLE(-1).value:
+                ft = ctypes.c_ulonglong(int((ts + 11644473600) * 10_000_000))
+                k32.SetFileTime(h, ctypes.byref(ft), None, None)
+                k32.CloseHandle(h)
+        except Exception:  # noqa: BLE001 - 생성 시각 설정 실패는 무시
+            pass
+
+
 def process_image(src: Path, mode: str, value: int, fmt: str, quality: int,
-                  max_kb: int) -> tuple[bytes, str, tuple[int, int]]:
-    """mode: 'long'(긴 변 px) | 'width'(가로 px) | 'percent'. (데이터, 확장자, 최종 해상도) 반환."""
+                  max_kb: int) -> tuple[bytes, str, tuple[int, int], float]:
+    """mode: 'long'(긴 변 px) | 'width'(가로 px) | 'percent'.
+    (데이터, 확장자, 최종 해상도, 원본 생성일 timestamp) 반환."""
     with Image.open(src) as im:
+        created = content_date(im, src)
         im = ImageOps.exif_transpose(im)
+        exif = build_exif(im, created)
         w, h = im.size
         if mode == "long":
             scale = value / max(w, h)
@@ -187,25 +233,27 @@ def process_image(src: Path, mode: str, value: int, fmt: str, quality: int,
         im = im.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
 
         if fmt == "PNG" or (fmt == "원본 유지" and src.suffix.lower() == ".png"):
-            return encode(im, "PNG"), ".png", im.size
+            return encode(im, "PNG", exif), ".png", im.size, created
         if im.mode != "RGB":
             im = im.convert("RGB")
         if max_kb > 0:
-            data, size = fit_jpeg(im, max_kb * 1024)
-            return data, ".jpg", size
-        return encode(im, "JPEG", quality=quality, optimize=True), ".jpg", im.size
+            data, size = fit_jpeg(im, max_kb * 1024, exif)
+            return data, ".jpg", size, created
+        return encode(im, "JPEG", exif, quality=quality, optimize=True), ".jpg", im.size, created
 
 
 def resize_image(src: Path, out_dir: Path, *settings) -> Path:
-    data, ext, _ = process_image(src, *settings)
+    data, ext, _, created = process_image(src, *settings)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = unique_path(out_dir, src.stem + ext)
     out.write_bytes(data)
+    set_file_times(out, created)
     return out
 
 
 # ---------------------------------------------------------------- 사진 정보
-GRID_THUMB = 160
+THUMB_MAX = 256  # 저장해 두는 썸네일 최대 크기 (그리드 크기 슬라이더의 상한)
+THUMB_MIN, THUMB_STEP = 80, 8
 LIST_THUMB = 44
 
 
@@ -219,6 +267,7 @@ class Photo:
     height: int
     thumb: Image.Image
     tk_big: ImageTk.PhotoImage | None = None
+    tk_big_size: int = 0
     tk_small: ImageTk.PhotoImage | None = None
 
 
@@ -242,9 +291,9 @@ def load_photo(path: Path) -> Photo:
         w, h = im.size
         if im.getexif().get(274, 1) in (5, 6, 7, 8):  # 회전된 사진은 가로/세로 교환
             w, h = h, w
-        im.draft("RGB", (GRID_THUMB * 2, GRID_THUMB * 2))  # JPEG 디코딩 가속
+        im.draft("RGB", (THUMB_MAX * 2, THUMB_MAX * 2))  # JPEG 디코딩 가속
         thumb = ImageOps.exif_transpose(im).convert("RGB")
-        thumb.thumbnail((GRID_THUMB, GRID_THUMB))
+        thumb.thumbnail((THUMB_MAX, THUMB_MAX))
     return Photo(path, path.stat().st_size, kind, created, w, h, thumb)
 
 
@@ -272,7 +321,6 @@ def create_server(on_received) -> Flask:
 
 
 # ---------------------------------------------------------------- UI
-CELL_W, CELL_H = 176, 204
 SEL_BG, SEL_OUT = "#cfe3ff", "#0071e3"
 MODE_DEFAULT = {"long": 1920, "width": 1920, "percent": 50}
 MODE_UNIT = {"long": "px", "width": "px", "percent": "%"}
@@ -353,15 +401,15 @@ class App(tk.Tk):
 
         box = ttk.LabelFrame(left, text="리사이즈 설정", padding=8)
         box.pack(fill="x")
-        self.mode = tk.StringVar(value="long")
+        self.mode = tk.StringVar(value="percent")
         self.mode_values = dict(MODE_DEFAULT)
-        self._prev_mode = "long"
-        for text, val in (("긴 변 기준", "long"), ("가로 기준", "width"), ("비율", "percent")):
+        self._prev_mode = "percent"
+        for text, val in (("비율", "percent"), ("긴 변 기준", "long"), ("가로 기준", "width")):
             ttk.Radiobutton(box, text=text, value=val, variable=self.mode,
                             command=self._on_mode).pack(anchor="w")
 
         vrow = ttk.Frame(box); vrow.pack(fill="x", pady=(6, 0))
-        self.value = tk.IntVar(value=1920)
+        self.value = tk.IntVar(value=MODE_DEFAULT["percent"])
         self.spin = ttk.Spinbox(vrow, from_=1, to=20000, textvariable=self.value, width=7)
         self.spin.pack(side="left")
         self.unit = ttk.Label(vrow, text="px", width=3)
@@ -386,6 +434,11 @@ class App(tk.Tk):
         ttk.Spinbox(row, from_=10, to=50000, increment=50, textvariable=self.limit_kb,
                     width=7).pack(side="left", padx=4)
 
+        self.delete_orig = tk.BooleanVar(value=bool(self.settings.get("delete_original")) and send2trash is not None)
+        ttk.Checkbutton(box, text="리사이즈 후 원본을 휴지통으로 이동", variable=self.delete_orig,
+                        command=self._save_delete_orig,
+                        state="normal" if send2trash else "disabled").pack(anchor="w", pady=(6, 0))
+
         ttk.Separator(box).pack(fill="x", pady=6)
         self.est_text = tk.StringVar()
         ttk.Label(box, textvariable=self.est_text, justify="left", width=40).pack(anchor="w")
@@ -406,6 +459,17 @@ class App(tk.Tk):
         for text, val in (("▦ 그리드", "grid"), ("☰ 리스트", "list")):
             ttk.Radiobutton(bar, text=text, value=val, variable=self.view, style="Toolbutton",
                             command=self._show_view).pack(side="left", padx=(8 if val == "grid" else 0, 0))
+        self.thumb_size = int(self.settings.get("thumb_size", 160))
+        self.thumb_size = min(THUMB_MAX, max(THUMB_MIN, self.thumb_size))
+        self.cell_w, self.cell_h = self.thumb_size + 16, self.thumb_size + 44
+        self.size_frame = ttk.Frame(bar)
+        ttk.Label(self.size_frame, text="▫", foreground="#888").pack(side="left")
+        self.size_scale = ttk.Scale(self.size_frame, from_=THUMB_MIN, to=THUMB_MAX, length=110,
+                                    command=self._on_thumb_scale)
+        self.size_scale.set(self.thumb_size)
+        self.size_scale.pack(side="left", padx=2)
+        ttk.Label(self.size_frame, text="▣", foreground="#888").pack(side="left")
+        self.size_scale.bind("<ButtonRelease-1>", lambda _e: self._save_thumb_size())
         self.sort_desc = tk.BooleanVar(value=True)
         self.order_btn = ttk.Button(bar, width=9, command=self._toggle_order)
         self.order_btn.pack(side="right")
@@ -435,7 +499,12 @@ class App(tk.Tk):
         self.value.trace_add("write", lambda *_: self._sync_scale())
         self._on_mode()
         self._refresh_order_btn()
-        self.bind_all("<Command-a>" if MAC else "<Control-a>", lambda _e: self._select_all())
+        for seq in ("<Command-a>", "<Command-A>", "<Control-a>", "<Control-A>"):
+            try:
+                self.bind_all(seq, self._key_select_all)
+            except tk.TclError:
+                pass  # 이 플랫폼에 없는 수식어(Command 등)
+        self._build_context_menu()
 
     def _build_grid(self):
         self.grid_frame = ttk.Frame(self.holder)
@@ -448,6 +517,8 @@ class App(tk.Tk):
         self.canvas.bind("<Configure>", lambda _e: self._draw_grid())
         self.canvas.bind("<Button-1>", self._grid_click)
         self.canvas.bind("<MouseWheel>", self._wheel)
+        if self._has_event("<TouchpadScroll>"):
+            self.canvas.bind("<TouchpadScroll>", self._touchpad)
         self.canvas.bind("<Button-4>", lambda _e: self.canvas.yview_scroll(-2, "units"))
         self.canvas.bind("<Button-5>", lambda _e: self.canvas.yview_scroll(2, "units"))
 
@@ -470,16 +541,133 @@ class App(tk.Tk):
         sb.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._tree_select)
+        self.tree.bind("<MouseWheel>", self._tree_wheel)
+        if self._has_event("<TouchpadScroll>"):
+            self.tree.bind("<TouchpadScroll>", self._tree_touchpad)
         self._show_view()
 
     def _show_view(self):
         self.grid_frame.pack_forget()
         self.list_frame.pack_forget()
-        (self.grid_frame if self.view.get() == "grid" else self.list_frame).pack(fill="both", expand=True)
+        grid = self.view.get() == "grid"
+        (self.grid_frame if grid else self.list_frame).pack(fill="both", expand=True)
+        if grid:
+            self.size_frame.pack(side="left", padx=12)
+        else:
+            self.size_frame.pack_forget()
         self._redraw()
 
-    def _wheel(self, e):
-        self.canvas.yview_scroll(-e.delta if MAC else -e.delta // 120 * 2, "units")
+    def _on_thumb_scale(self, v):
+        size = min(THUMB_MAX, max(THUMB_MIN, round(float(v) / THUMB_STEP) * THUMB_STEP))
+        if size == self.thumb_size:
+            return
+        self.thumb_size = size
+        self.cell_w, self.cell_h = size + 16, size + 44
+        if getattr(self, "_thumb_job", None) is None:
+            self._thumb_job = self.after(30, self._apply_thumb_size)
+
+    def _apply_thumb_size(self):
+        self._thumb_job = None
+        top = self.canvas.yview()[0]  # 크기를 바꿔도 보던 위치 비율을 유지
+        self._draw_grid()
+        self.canvas.yview_moveto(top)
+
+    def _save_thumb_size(self):
+        self.settings["thumb_size"] = self.thumb_size
+        save_settings(self.settings)
+
+    def _has_event(self, seq: str) -> bool:
+        try:  # Tk 8.6에는 TouchpadScroll 이벤트가 없다
+            self.bind_class("PRProbe", seq, lambda _e: None)
+            return True
+        except tk.TclError:
+            return False
+
+    @staticmethod
+    def _wheel_steps(delta: int) -> float:
+        return delta / 120 if abs(delta) >= 120 else float(delta)  # Windows/Tk9: 120 단위, 구 macOS: 1 단위
+
+    def _scroll_px(self, px: float):
+        c = self.canvas
+        region = c.cget("scrollregion").split()
+        total = float(region[3]) if len(region) == 4 else 0.0
+        if total <= c.winfo_height():
+            return
+        top = c.yview()[0] * total
+        c.yview_moveto(max(0.0, min(1.0, (top + px) / total)))
+
+    def _wheel(self, e):  # 마우스 휠
+        self._scroll_px(-self._wheel_steps(e.delta) * self.cell_h / 3)
+        return "break"
+
+    def _precise(self, e) -> tuple[float, float]:
+        dx, dy = (float(v) for v in self.tk.splitlist(self.tk.call("tk::PreciseScrollDeltas", e.delta)))
+        return dx, dy
+
+    def _touchpad(self, e):  # macOS 트랙패드 두 손가락 스크롤 (Tk 9)
+        self._scroll_px(-self._precise(e)[1])
+        return "break"
+
+    _tree_acc = 0.0
+
+    def _tree_wheel(self, e):
+        self.tree.yview_scroll(int(-self._wheel_steps(e.delta) * 3), "units")
+        return "break"
+
+    def _tree_touchpad(self, e):
+        self._tree_acc += -self._precise(e)[1] / (LIST_THUMB + 8)
+        rows = int(self._tree_acc)
+        if rows:
+            self._tree_acc -= rows
+            self.tree.yview_scroll(rows, "units")
+        return "break"
+
+    # ---- 전체 선택 / 우클릭 메뉴 ----
+    def _key_select_all(self, _e):
+        if isinstance(self.focus_get(), (tk.Entry, ttk.Entry)):
+            return None  # 입력칸에서는 글자 전체 선택(기본 동작)
+        self._select_all()
+        return "break"
+
+    def _select_none(self):
+        self.selected.clear()
+        self._redraw()
+        self._selection_changed()
+
+    def _build_context_menu(self):
+        self.ctx = tk.Menu(self, tearoff=False)
+        self.ctx.add_command(label="전체 선택", accelerator="⌘A" if MAC else "Ctrl+A",
+                             command=self._select_all)
+        self.ctx.add_command(label="선택 해제", command=self._select_none)
+        seqs = ("<Button-2>", "<Button-3>", "<Control-Button-1>") if MAC else ("<Button-3>",)
+        for seq in seqs:
+            self.canvas.bind(seq, self._grid_context)
+            self.tree.bind(seq, self._tree_context)
+
+    def _popup(self, e):
+        try:
+            self.ctx.tk_popup(e.x_root, e.y_root)
+        finally:
+            self.ctx.grab_release()
+        return "break"
+
+    def _grid_context(self, e):
+        self.canvas.focus_set()
+        x, y = self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
+        col, row = int(x // self.cell_w), int(y // self.cell_h)
+        idx = row * self.cols + col
+        if col < self.cols and 0 <= idx < len(self.order) and self.order[idx] not in self.selected:
+            self.selected = {self.order[idx]}
+            self.anchor = self.order[idx]
+            self._draw_grid()
+            self._selection_changed()
+        return self._popup(e)
+
+    def _tree_context(self, e):
+        iid = self.tree.identify_row(e.y)
+        if iid and iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        return self._popup(e)
 
     # ---- QR / 서버 ----
     def _update_qr(self):
@@ -517,7 +705,6 @@ class App(tk.Tk):
         self.pool.submit(work)
 
     def _on_loaded(self, photo: Photo):
-        photo.tk_big = ImageTk.PhotoImage(photo.thumb)
         small = photo.thumb.copy()
         small.thumbnail((LIST_THUMB, LIST_THUMB))
         photo.tk_small = ImageTk.PhotoImage(small)
@@ -586,23 +773,32 @@ class App(tk.Tk):
         else:
             self._fill_tree()
 
+    def _big(self, ph: Photo) -> ImageTk.PhotoImage:
+        size = self.thumb_size
+        if ph.tk_big is None or ph.tk_big_size != size:
+            t = ph.thumb.copy()
+            t.thumbnail((size, size), Image.LANCZOS)
+            ph.tk_big, ph.tk_big_size = ImageTk.PhotoImage(t), size
+        return ph.tk_big
+
     def _draw_grid(self):
         c = self.canvas
         c.delete("all")
-        width = max(c.winfo_width(), CELL_W)
-        self.cols = max(1, width // CELL_W)
+        cw, ch, size = self.cell_w, self.cell_h, self.thumb_size
+        width = max(c.winfo_width(), cw)
+        self.cols = max(1, width // cw)
         rows = -(-len(self.order) // self.cols)
-        c.configure(scrollregion=(0, 0, width, max(rows * CELL_H, 1)))
+        c.configure(scrollregion=(0, 0, width, max(rows * ch, 1)))
         for i, p in enumerate(self.order):
             ph = self.photos[p]
             r, col = divmod(i, self.cols)
-            x0, y0 = col * CELL_W, r * CELL_H
+            x0, y0 = col * cw, r * ch
             sel = p in self.selected
-            c.create_rectangle(x0 + 4, y0 + 4, x0 + CELL_W - 4, y0 + CELL_H - 4,
+            c.create_rectangle(x0 + 4, y0 + 4, x0 + cw - 4, y0 + ch - 4,
                                fill=SEL_BG if sel else "", outline=SEL_OUT if sel else "", width=2)
-            c.create_image(x0 + CELL_W // 2, y0 + 10 + GRID_THUMB // 2, image=ph.tk_big)
-            c.create_text(x0 + CELL_W // 2, y0 + GRID_THUMB + 32, text=shorten(p.name),
-                          width=CELL_W - 16, fill="black")
+            c.create_image(x0 + cw // 2, y0 + 10 + size // 2, image=self._big(ph))
+            c.create_text(x0 + cw // 2, y0 + size + 32, text=shorten(p.name, max(10, cw // 8)),
+                          width=cw - 16, fill="black")
 
     def _fill_tree(self):
         self._syncing = True
@@ -620,7 +816,7 @@ class App(tk.Tk):
     def _grid_click(self, e):
         self.canvas.focus_set()
         x, y = self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
-        col, row = int(x // CELL_W), int(y // CELL_H)
+        col, row = int(x // self.cell_w), int(y // self.cell_h)
         idx = row * self.cols + col
         p = self.order[idx] if col < self.cols and 0 <= idx < len(self.order) else None
         shift, toggle = e.state & 0x1, e.state & TOGGLE_MASK
@@ -770,10 +966,14 @@ class App(tk.Tk):
             messagebox.showwarning("설정 오류", "설정 값을 확인하세요.")
             return
         out_dir = Path(self.out_dir.get())
+        trash = self.delete_orig.get() and send2trash is not None
+        if trash and not messagebox.askokcancel(
+                "원본 삭제", f"리사이즈에 성공한 원본 {len(files)}장을 휴지통으로 옮깁니다.\n계속할까요?"):
+            return
         self.busy = True
 
         def work():
-            ok, errors = 0, []
+            ok, errors, trashed = 0, [], []
             for i, f in enumerate(files, 1):
                 self.q.put(("progress", f"리사이즈 중... {i}/{len(files)}"))
                 try:
@@ -781,15 +981,32 @@ class App(tk.Tk):
                     ok += 1
                 except Exception as e:  # noqa: BLE001 - 파일별 오류를 모아서 표시
                     errors.append(f"{f.name}: {e}")
-            self.q.put(("done", ok, errors, str(out_dir)))
+                    continue
+                if trash:  # 리사이즈에 성공한 파일만 휴지통으로
+                    try:
+                        send2trash(str(f))
+                        trashed.append(f)
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"{f.name}: 휴지통 이동 실패 ({e})")
+            self.q.put(("done", ok, errors, str(out_dir), trashed))
         threading.Thread(target=work, daemon=True).start()
 
     def _on_progress(self, text: str):
         self.status.set(text)
 
-    def _on_done(self, ok: int, errors: list, out_dir: str):
+    def _on_done(self, ok: int, errors: list, out_dir: str, trashed: list):
         self.busy = False
-        self.status.set(f"{ok}장 리사이즈 완료 → {out_dir}")
+        msg = f"{ok}장 리사이즈 완료 → {out_dir}"
+        if trashed:
+            gone = set(trashed)
+            self.order = [p for p in self.order if p not in gone]
+            self.selected -= gone
+            for p in gone:
+                self.photos.pop(p, None)
+            self._redraw()
+            self._schedule_estimate()
+            msg += f" (원본 {len(trashed)}장 휴지통으로 이동)"
+        self.status.set(msg)
         if errors:
             messagebox.showwarning("일부 실패", "\n".join(errors[:10]))
 
@@ -797,6 +1014,10 @@ class App(tk.Tk):
     @staticmethod
     def _fmt_built(ts) -> str:
         return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M") if ts else "알 수 없음"
+
+    def _save_delete_orig(self):
+        self.settings["delete_original"] = self.delete_orig.get()
+        save_settings(self.settings)
 
     def _save_auto_update(self):
         self.settings["auto_update"] = self.auto_update.get()

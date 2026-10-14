@@ -3,3 +3,4 @@ pillow
 pillow-heif
 qrcode
 pyinstaller
+send2trash
