@@ -46,3 +46,7 @@ jobs:
             gh release create latest --repo "$GITHUB_REPOSITORY" --title "Latest build" --notes "main 브랜치 최신 빌드"
           gh release upload latest PhotoReceiver.exe --repo "$GITHUB_REPOSITORY" --clobber
           gh release upload latest update-win.json --repo "$GITHUB_REPOSITORY" --clobber
+          # 릴리스 이름에 버전을 넣는다 (태그는 업데이트 주소 때문에 'latest' 유지)
+          VER=$(jq -r .version update-win.json)
+          gh release edit latest --repo "$GITHUB_REPOSITORY" --title "PhotoReceiver v$VER" \
+            --notes "v$VER (빌드 ${GITHUB_SHA::7}) - main 브랜치 최신 빌드"

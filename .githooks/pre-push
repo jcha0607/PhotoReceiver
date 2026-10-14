@@ -33,4 +33,8 @@ gh release view latest --repo "$REPO" >/dev/null 2>&1 \
 gh release upload latest "$TMP/dist/PhotoReceiver.dmg" --repo "$REPO" --clobber >&2 \
   && gh release upload latest "$TMP/dist/update-mac.json" --repo "$REPO" --clobber >&2 \
   || warn "업로드 실패"
+# 릴리스 이름에 버전을 넣는다 (태그는 업데이트 주소 때문에 'latest' 유지)
+VER=$(python3 -c "import json;print(json.load(open('$TMP/dist/update-mac.json'))['version'])" 2>/dev/null)
+[ -n "$VER" ] && gh release edit latest --repo "$REPO" --title "PhotoReceiver v$VER" \
+  --notes "v$VER (빌드 ${SHA:0:7}) - main 브랜치 최신 빌드" >&2 || true
 echo "pre-push: DMG 업로드 완료 (https://github.com/$REPO/releases/tag/latest)" >&2
