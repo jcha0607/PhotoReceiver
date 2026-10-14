@@ -5,15 +5,18 @@ import os
 import queue
 import re
 import socket
+import shutil
 import subprocess
 import sys
 import threading
+import uuid
 import tkinter as tk
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote
 from tkinter import filedialog, messagebox, ttk
 
 import qrcode
@@ -21,6 +24,7 @@ from flask import Flask, jsonify, request
 from PIL import Image, ImageOps, ImageTk
 
 import updater
+from web_page import PAGE
 
 try:
     from send2trash import send2trash
@@ -38,36 +42,6 @@ BASE_DIR = Path.home() / "Pictures" / "PhotoReceiver"
 RECEIVED_DIR = BASE_DIR / "received"
 DEFAULT_OUT_DIR = BASE_DIR / "resized"
 
-UPLOAD_PAGE = """<!doctype html>
-<html lang="ko"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>사진 보내기</title>
-<style>
- body{font-family:-apple-system,sans-serif;margin:0;padding:24px;background:#f5f5f7;color:#1d1d1f}
- h1{font-size:22px;margin:0 0 16px}
- label.btn,button{display:block;width:100%;box-sizing:border-box;padding:16px;border:0;border-radius:12px;
-  background:#0071e3;color:#fff;font-size:17px;text-align:center;margin-bottom:12px}
- button:disabled{background:#999}
- input[type=file]{display:none}
- #list div{background:#fff;border-radius:10px;padding:10px 12px;margin-bottom:8px;font-size:14px;word-break:break-all}
- .ok{color:#1a8f3c}.err{color:#d70015}
-</style></head><body>
-<h1>사진 보내기</h1>
-<label class="btn">사진 선택<input id="f" type="file" accept="image/*" multiple></label>
-<button id="go" disabled>보내기</button>
-<div id="list"></div>
-<script>
-const f=document.getElementById('f'),go=document.getElementById('go'),list=document.getElementById('list');
-f.onchange=()=>{list.innerHTML='';[...f.files].forEach((x,i)=>{const d=document.createElement('div');
- d.id='r'+i;d.textContent=x.name;list.appendChild(d)});go.disabled=!f.files.length;
- go.textContent='보내기 ('+f.files.length+'장)'};
-go.onclick=async()=>{go.disabled=true;
- for(let i=0;i<f.files.length;i++){const d=document.getElementById('r'+i);d.textContent+=' ...';
-  const fd=new FormData();fd.append('photo',f.files[i]);
-  try{const r=await fetch('/upload',{method:'POST',body:fd});if(!r.ok)throw 0;
-   d.className='ok';d.textContent='✓ '+f.files[i].name}catch(e){d.className='err';d.textContent='✗ '+f.files[i].name}}
- go.textContent='완료';};
-</script></body></html>"""
 
 
 # ---------------------------------------------------------------- 유틸
@@ -300,20 +274,46 @@ def load_photo(path: Path) -> Photo:
 # ---------------------------------------------------------------- 서버
 def create_server(on_received) -> Flask:
     app = Flask(__name__)
-    app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+    app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024
+    lock = threading.Lock()
+    seen: set[str] = set()  # "원본파일명|바이트수" — 이미 받은 사진 (앱 실행 중 유지)
 
     @app.get("/")
     def index():
-        return UPLOAD_PAGE
+        return PAGE
+
+    @app.post("/check")
+    def check():
+        keys = (request.get_json(silent=True) or {}).get("keys", [])
+        with lock:
+            return jsonify(have=[k for k in keys if k in seen])
+
+    @app.post("/reset")
+    def reset():
+        with lock:
+            seen.clear()
+        return jsonify(ok=True)
 
     @app.post("/upload")
     def upload():
-        file = request.files.get("photo")
-        if not file or not file.filename:
-            return jsonify(error="no file"), 400
+        raw = unquote(request.headers.get("X-Filename", "photo.jpg"))
         RECEIVED_DIR.mkdir(parents=True, exist_ok=True)
-        path = unique_path(RECEIVED_DIR, safe_name(file.filename))
-        file.save(path)
+        tmp = RECEIVED_DIR / f".{uuid.uuid4().hex}.part"
+        try:
+            with open(tmp, "wb") as f:  # 본문을 디스크로 바로 스트리밍 (메모리에 올리지 않음)
+                shutil.copyfileobj(request.stream, f, 256 * 1024)
+            size = tmp.stat().st_size
+            if size == 0 or (request.content_length and size != request.content_length):
+                return jsonify(error="incomplete"), 400
+            key = f"{raw}|{size}"
+            with lock:
+                if key in seen:  # 재시도·중복 요청
+                    return jsonify(ok=True, dup=True)
+                path = unique_path(RECEIVED_DIR, safe_name(raw))
+                os.replace(tmp, path)
+                seen.add(key)
+        finally:
+            tmp.unlink(missing_ok=True)
         on_received(path)
         return jsonify(ok=True)
 
@@ -339,7 +339,9 @@ class App(tk.Tk):
         super().__init__()
         self.title("PhotoReceiver")
         self.q: "queue.Queue[tuple]" = queue.Queue()
-        self.pool = ThreadPoolExecutor(max_workers=3)
+        self.pool = ThreadPoolExecutor(max_workers=3)  # 예상 용량·업데이트 확인
+        self.load_pool = ThreadPoolExecutor(max_workers=4)  # 받은 사진 썸네일 로딩 (수백 장이어도 위 작업을 막지 않음)
+        self._redraw_job = None
         self.photos: dict[Path, Photo] = {}
         self.order: list[Path] = []
         self.selected: set[Path] = set()
@@ -702,7 +704,7 @@ class App(tk.Tk):
                 self.q.put(("loaded", load_photo(path)))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("load_failed", path, str(e)))
-        self.pool.submit(work)
+        self.load_pool.submit(work)
 
     def _on_loaded(self, photo: Photo):
         small = photo.thumb.copy()
@@ -711,9 +713,14 @@ class App(tk.Tk):
         self.photos[photo.path] = photo
         self.order.append(photo.path)
         self._sort()
-        self._redraw()
-        self.status.set(f"받음: {photo.path.name}")
+        if self._redraw_job is None:  # 수백 장이 연달아 들어와도 화면은 0.25초마다 한 번만 다시 그린다
+            self._redraw_job = self.after(250, self._flush_redraw)
+        self.status.set(f"받음 {len(self.photos)}장 · 최근: {photo.path.name}")
         self._schedule_estimate()
+
+    def _flush_redraw(self):
+        self._redraw_job = None
+        self._redraw()
 
     def _on_load_failed(self, path: Path, err: str):
         self.status.set(f"열 수 없는 파일: {path.name} ({err})")
