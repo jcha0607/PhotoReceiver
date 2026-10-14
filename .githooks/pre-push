@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# main 푸시 직전에 맥용 DMG를 로컬에서 빌드해 'latest' 릴리스에 올린다.
+# 건너뛰기: SKIP_DMG=1 git push   /   켜기: git config core.hooksPath .githooks
+# 빌드나 업로드가 실패해도 푸시는 막지 않고 경고만 출력한다.
+[ -n "${SKIP_DMG:-}" ] && exit 0
+
+ROOT=$(git rev-parse --show-toplevel)
+SHA=""
+while read -r local_ref local_sha remote_ref _; do
+  [ "$remote_ref" = "refs/heads/main" ] && SHA="$local_sha"
+done
+[ -z "$SHA" ] && exit 0
+case "$SHA" in 0000000*) exit 0 ;; esac
+
+warn() { echo "pre-push: DMG 건너뜀 - $1 (푸시는 계속됩니다)" >&2; exit 0; }
+command -v gh >/dev/null || warn "gh CLI 없음"
+[ -x "$ROOT/venv/bin/python3" ] || warn "venv 없음 (python3.12 -m venv venv && venv/bin/pip install -r requirements.txt)"
+
+REPO=$(git config --get remote.origin.url | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+echo "pre-push: ${SHA:0:7} 기준 DMG 빌드 중..." >&2
+git archive "$SHA" | tar -x -C "$TMP"
+( cd "$TMP" && PATH="$ROOT/venv/bin:$PATH" bash scripts/build_mac.sh >"$TMP/build.log" 2>&1 ) \
+  || { tail -5 "$TMP/build.log" >&2; warn "빌드 실패"; }
+
+gh release view latest --repo "$REPO" >/dev/null 2>&1 \
+  || gh release create latest --repo "$REPO" --title "Latest build" \
+       --notes "main 브랜치 최신 빌드 (macOS DMG는 로컬, Windows exe는 Actions에서 갱신)" >&2 \
+  || warn "릴리스 생성 실패"
+gh release upload latest "$TMP/dist/PhotoReceiver.dmg" --repo "$REPO" --clobber >&2 \
+  || warn "업로드 실패"
+echo "pre-push: DMG 업로드 완료 (https://github.com/$REPO/releases/tag/latest)" >&2
