@@ -30,7 +30,7 @@ summary{font-size:14px;color:var(--sub)}
 .link{background:none;color:var(--sub);font-size:12px;text-decoration:underline;width:auto;margin:14px auto 0;padding:6px}
 </style></head><body>
 <h1>사진 보내기</h1>
-<p class="sub">한 번에 <b>최대 150장</b>까지 선택하세요. 여러 번 나눠 선택해도 되고, 이미 선택한 사진은 자동으로 제외됩니다.<br>오래된 사진은 iPhone이 iCloud에서 다시 내려받아야 해서, 사진을 선택할 때 시간이 더 걸릴 수 있어요.<br>전송이 끝날 때까지 화면을 켜 두고 이 페이지를 유지하세요.</p>
+<p class="sub">한 번에 <b>최대 150장</b>까지 선택하세요. 여러 번 나눠 선택해도 되고, 이미 선택한 사진은 자동으로 제외됩니다.<br>오래된 사진은 iPhone이 iCloud에서 다시 내려받아야 해서, 사진을 선택할 때 시간이 더 걸릴 수 있어요.<br>아이폰 설정 → 사진 → 맨 아래 “Mac 또는 PC로 전송”을 <b>“원본 유지”</b>로 바꿔 보세요. 기본값(자동)이면 iPhone이 HEIC를 JPEG로 바꾸느라 시간이 걸립니다.<br>전송이 끝날 때까지 화면을 켜 두고 이 페이지를 유지하세요.</p>
 <button id="pick">사진 선택 (최대 150장씩)</button>
 <div class="card"><div id="sum">선택한 사진이 없습니다</div><div class="bar"><i id="bar"></i></div><div id="msg"></div><div id="stat"></div></div>
 <button id="go" disabled>보내기</button>
