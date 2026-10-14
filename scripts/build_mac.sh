@@ -9,6 +9,14 @@ python3 scripts/write_build_info.py
 python3 -m PyInstaller --windowed --noconfirm --name PhotoReceiver \
   --collect-all pillow_heif app.py
 
+# 앱 번들에 버전 기록 (Info.plist를 고치면 서명이 깨지므로 ad-hoc 재서명)
+VERSION=$(python3 -c "from version import __version__; print(__version__)")
+PLIST=dist/PhotoReceiver.app/Contents/Info.plist
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
+plutil -replace CFBundleVersion -string "$VERSION" "$PLIST"
+xattr -cr dist/PhotoReceiver.app
+codesign --force --deep --sign - dist/PhotoReceiver.app
+
 # DMG: .app 과 /Applications 바로가기를 함께 담는다
 STAGE=$(mktemp -d)
 cp -R dist/PhotoReceiver.app "$STAGE/"

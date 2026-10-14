@@ -26,21 +26,12 @@ summary{font-size:14px;color:var(--sub)}
 .row{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:5px 0;border-top:1px solid var(--line)}
 .row .n{word-break:break-all}.row .d{color:var(--sub)}.row .s{white-space:nowrap;color:var(--sub)}
 .row.done .s,.row.sent .s{color:var(--green)}.row.err .s{color:var(--red)}.row.up .s{color:var(--blue)}
-.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--blue);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:6px}
-@keyframes sp{to{transform:rotate(360deg)}}
-#prep{border:1px solid var(--blue);font-size:14px;line-height:1.5}
-#prep small{display:block;color:var(--sub);font-size:12px;margin-top:2px}
-#prep a{color:var(--sub);font-size:12px;text-decoration:underline}
 #stat{font-size:12px;color:var(--sub);margin-top:6px}
 .link{background:none;color:var(--sub);font-size:12px;text-decoration:underline;width:auto;margin:14px auto 0;padding:6px}
 </style></head><body>
 <h1>사진 보내기</h1>
-<p class="sub">전송이 끝날 때까지 화면을 켜 두고 이 페이지를 유지하세요.<br>
-여러 번 나눠 선택해도 되고, 이미 선택한 사진은 자동으로 제외됩니다.</p>
-<button id="pick">사진 선택 (추가)</button>
-<div class="card" id="prep" hidden><span class="spin"></span><b id="prepTxt"></b>
-<small>사진이 많으면 iPhone이 사진을 준비하는 동안 화면이 멈춰 보일 수 있어요. 이 단계의 진행률은 iPhone이 알려주지 않아 경과 시간만 표시합니다.</small>
-<a id="prepX" href="#">선택 창을 닫았는데 계속 이 화면이면 눌러 주세요</a></div>
+<p class="sub">한 번에 <b>최대 150장</b>까지 선택하세요. 여러 번 나눠 선택해도 되고, 이미 선택한 사진은 자동으로 제외됩니다.<br>전송이 끝날 때까지 화면을 켜 두고 이 페이지를 유지하세요.</p>
+<button id="pick">사진 선택 (최대 150장씩)</button>
 <div class="card"><div id="sum">선택한 사진이 없습니다</div><div class="bar"><i id="bar"></i></div><div id="msg"></div><div id="stat"></div></div>
 <button id="go" disabled>보내기</button>
 <button id="retry" class="alt" hidden>실패한 사진 다시 보내기</button>
@@ -48,7 +39,7 @@ summary{font-size:14px;color:var(--sub)}
 <button id="reset" class="link">전송 기록 지우기 (이미 보낸 사진도 다시 보내기)</button>
 <script>
 const $=id=>document.getElementById(id);
-const CONC=3, MAXTRY=4, LABEL={wait:'대기',up:'전송 중',done:'완료',err:'실패',sent:'이미 전송됨'};
+const CONC=3, MAXTRY=4, MAXPICK=150, LABEL={wait:'대기',up:'전송 중',done:'완료',err:'실패',sent:'이미 전송됨'};
 const items=[], byKey=new Map(), holders=[];
 const cnt={wait:0,up:0,done:0,err:0,sent:0};
 let running=false, active=0, lock=null, raf=0, t0=Date.now(), b0=0;
@@ -58,25 +49,17 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function pick(){            // 선택할 때마다 새 input을 만들어 이전 선택의 파일 참조를 유지한다
   const inp=document.createElement('input');
   inp.type='file'; inp.multiple=true; inp.accept='image/*,image/heic,image/heif,.heic,.heif';
-  inp.onchange=()=>{ hidePrep(); addFiles([...inp.files]); };
-  inp.addEventListener('cancel',hidePrep);
-  holders.push(inp); showPrep(); inp.click();
+  inp.onchange=()=>{
+    let files=[...inp.files], over=0;
+    if(files.length>MAXPICK){ over=files.length-MAXPICK; files=files.slice(0,MAXPICK); }
+    addFiles(files,over);
+  };
+  holders.push(inp); inp.click();
 }
-let prepT=0, prepTimer=0;
-function showPrep(){
-  hidePrep(); prepT=Date.now(); $('prep').hidden=false;
-  const tick=()=>{ const s=Math.floor((Date.now()-prepT)/1000);
-    $('prepTxt').textContent='사진을 선택·준비하는 중… '+s+'초 경과'; if(s>=300) hidePrep(); };
-  tick(); prepTimer=setInterval(tick,500);
-}
-function hidePrep(){ clearInterval(prepTimer); prepTimer=0; $('prep').hidden=true; }
-$('prepX').onclick=e=>{ e.preventDefault(); hidePrep(); };
 
-async function addFiles(files){
+async function addFiles(files,over=0){
   const frag=document.createDocumentFragment(), fresh=[]; let dups=0;
-  let n=0;
   for(const f of files){
-    if(++n%40===0){ $('msg').textContent='추가 중… '+n+'/'+files.length+' ('+Math.round(n*100/files.length)+'%)'; await new Promise(r=>setTimeout(r)); }
     const k=keyOf(f), ex=byKey.get(k);
     if(ex){ ex.dup++; ex.el.querySelector('.d').textContent=' · 중복 선택 ×'+ex.dup; dups++; continue; }
     const it={file:f,key:k,state:'wait',tries:0,dup:0};
@@ -89,6 +72,7 @@ async function addFiles(files){
   let msg=[];
   if(dups) msg.push(dups+'장은 이미 선택되어 제외했어요');
   if(fresh.length) msg.push(fresh.length+'장 추가');
+  if(over) msg.push('한 번에 최대 '+MAXPICK+'장까지만 추가돼요. 나머지 '+over+'장은 다시 선택해 주세요');
   $('msg').textContent=msg.join(' · ')||'선택한 사진이 없습니다';
   render();
   if(fresh.length){

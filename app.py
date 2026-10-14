@@ -24,6 +24,7 @@ from flask import Flask, jsonify, request
 from PIL import Image, ImageOps, ImageTk
 
 import updater
+from version import __version__
 from web_page import PAGE
 
 try:
@@ -337,7 +338,7 @@ def shorten(name: str, limit=24) -> str:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("PhotoReceiver")
+        self.title(f"PhotoReceiver {__version__}")
         self.q: "queue.Queue[tuple]" = queue.Queue()
         self.pool = ThreadPoolExecutor(max_workers=3)  # 예상 용량·업데이트 확인
         self.load_pool = ThreadPoolExecutor(max_workers=4)  # 받은 사진 썸네일 로딩 (수백 장이어도 위 작업을 막지 않음)
@@ -1031,7 +1032,7 @@ class App(tk.Tk):
         save_settings(self.settings)
 
     def _about(self):
-        messagebox.showinfo("버전 정보", f"PhotoReceiver\n빌드: {updater.COMMIT} ({self._fmt_built(updater.BUILT)})\n"
+        messagebox.showinfo("버전 정보", f"PhotoReceiver {__version__}\n빌드: {updater.COMMIT} ({self._fmt_built(updater.BUILT)})\n"
                             "업데이트: GitHub 'latest' 릴리스")
 
     def _auto_check(self):
@@ -1058,11 +1059,11 @@ class App(tk.Tk):
         if m is None:
             if manual:
                 self.status.set("최신 버전입니다")
-                messagebox.showinfo("업데이트", f"최신 버전입니다.\n빌드: {updater.COMMIT} ({self._fmt_built(updater.BUILT)})")
+                messagebox.showinfo("업데이트", f"최신 버전입니다.\nPhotoReceiver {__version__} (빌드 {updater.COMMIT})")
             return
         self.status.set("새 버전이 있습니다")
-        info = (f"새 버전이 있습니다.\n\n현재: {updater.COMMIT} ({self._fmt_built(updater.BUILT)})\n"
-                f"최신: {m.get('commit', '?')} ({self._fmt_built(m.get('built'))})\n\n")
+        info = (f"새 버전이 있습니다.\n\n현재: {__version__} (빌드 {updater.COMMIT}, {self._fmt_built(updater.BUILT)})\n"
+                f"최신: {m.get('version', '?')} (빌드 {m.get('commit', '?')}, {self._fmt_built(m.get('built'))})\n\n")
         if not updater.FROZEN:
             if messagebox.askyesno("업데이트", info + "소스에서 실행 중이라 자동 설치는 안 됩니다.\n릴리스 페이지를 열까요?"):
                 webbrowser.open(updater.RELEASE_PAGE)

@@ -20,6 +20,8 @@ BASE = os.environ.get("PHOTORECEIVER_UPDATE_BASE",
                       f"https://github.com/{REPO}/releases/download/latest")
 RELEASE_PAGE = f"https://github.com/{REPO}/releases/tag/latest"
 
+from version import __version__ as VERSION
+
 try:
     from build_info import BUILT, COMMIT  # 빌드 스크립트가 생성
 except ImportError:
