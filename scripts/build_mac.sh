@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 rm -rf build dist
+python3 scripts/write_build_info.py
 python3 -m PyInstaller --windowed --noconfirm --name PhotoReceiver \
   --collect-all pillow_heif app.py
 
@@ -14,4 +15,5 @@ cp -R dist/PhotoReceiver.app "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname PhotoReceiver -srcfolder "$STAGE" -ov -format UDZO dist/PhotoReceiver.dmg
 rm -rf "$STAGE"
+python3 scripts/make_manifest.py mac dist/PhotoReceiver.dmg dist/update-mac.json
 echo "생성됨: dist/PhotoReceiver.dmg"

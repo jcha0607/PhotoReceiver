@@ -16,11 +16,17 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - run: python scripts/write_build_info.py
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
       - run: pyinstaller --onefile --windowed --name PhotoReceiver --collect-all pillow_heif app.py
+      - run: python scripts/make_manifest.py win dist/PhotoReceiver.exe dist/update-win.json
       - uses: actions/upload-artifact@v4
         with:
           name: PhotoReceiver-windows
-          path: dist/PhotoReceiver.exe
+          path: |
+            dist/PhotoReceiver.exe
+            dist/update-win.json
 
   # main 푸시 시 'latest' 릴리스의 exe를 갱신한다 (DMG는 로컬 pre-push 훅이 올린다)
   publish:
@@ -39,3 +45,4 @@ jobs:
           gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create latest --repo "$GITHUB_REPOSITORY" --title "Latest build" --notes "main 브랜치 최신 빌드"
           gh release upload latest PhotoReceiver.exe --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload latest update-win.json --repo "$GITHUB_REPOSITORY" --clobber

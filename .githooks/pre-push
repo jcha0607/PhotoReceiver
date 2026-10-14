@@ -22,13 +22,15 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "pre-push: ${SHA:0:7} 기준 DMG 빌드 중..." >&2
 git archive "$SHA" | tar -x -C "$TMP"
-( cd "$TMP" && PATH="$ROOT/venv/bin:$PATH" bash scripts/build_mac.sh >"$TMP/build.log" 2>&1 ) \
+( cd "$TMP" && BUILD_COMMIT="$SHA" PATH="$ROOT/venv/bin:$PATH" bash scripts/build_mac.sh >"$TMP/build.log" 2>&1 ) \
   || { tail -5 "$TMP/build.log" >&2; warn "빌드 실패"; }
 
 gh release view latest --repo "$REPO" >/dev/null 2>&1 \
   || gh release create latest --repo "$REPO" --title "Latest build" \
        --notes "main 브랜치 최신 빌드 (macOS DMG는 로컬, Windows exe는 Actions에서 갱신)" >&2 \
   || warn "릴리스 생성 실패"
+# DMG를 먼저, manifest를 나중에 올려서 manifest가 없는 파일을 가리키지 않게 한다
 gh release upload latest "$TMP/dist/PhotoReceiver.dmg" --repo "$REPO" --clobber >&2 \
+  && gh release upload latest "$TMP/dist/update-mac.json" --repo "$REPO" --clobber >&2 \
   || warn "업로드 실패"
 echo "pre-push: DMG 업로드 완료 (https://github.com/$REPO/releases/tag/latest)" >&2
