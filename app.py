@@ -368,19 +368,35 @@ class App(tk.Tk):
         self._syncing = False
         self._closing = False
 
+        self.qr_px = 190
         self._build_ui()
-        self.update_idletasks()
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        min_w, min_h = self.winfo_reqwidth(), self.winfo_reqheight()
-        self.minsize(min_w, min_h)  # 모든 설정 항목이 잘리지 않는 최소 크기
-        w, h = min(max(1120, min_w), sw), min(max(800, min_h), sh - 80)
-        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2 - 20)}")  # 화면 중앙
-
+        self._fit_window(initial=True)
+        self.after(600, self._fit_window)  # 글꼴·문구가 자리 잡은 뒤 한 번 더 확인
         threading.Thread(target=self._serve, daemon=True).start()
         self.after(150, self._poll)
         self._schedule_estimate()
         if updater.FROZEN:  # 소스 실행(개발 중)에서는 자동 확인하지 않는다
             self.after(3000, self._auto_check)
+
+    def _fit_window(self, initial: bool = False):
+        """설정 패널이 잘리지 않도록 최소 크기를 내용에 맞추고, 창이 작으면 키운다."""
+        self.update_idletasks()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        max_h = sh - 80
+        if self.winfo_reqheight() > max_h and self.qr_px > 120:  # 낮은 화면에서는 QR을 줄여 맞춘다
+            self.qr_px = 120
+            self._update_qr()
+            self.update_idletasks()
+        need_w, need_h = min(self.winfo_reqwidth(), sw), min(self.winfo_reqheight(), max_h)
+        self.minsize(need_w, need_h)
+        cur_w, cur_h = self.winfo_width(), self.winfo_height()
+        w = max(1120 if initial else cur_w, need_w)
+        h = max(800 if initial else cur_h, need_h)
+        w, h = min(w, sw), min(h, max_h)
+        if initial:
+            self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 2 - 20)}")  # 화면 중앙
+        elif (w, h) != (cur_w, cur_h):
+            self.geometry(f"{w}x{h}")
 
     # ---- 화면 구성 ----
     def _build_ui(self):
@@ -461,9 +477,9 @@ class App(tk.Tk):
                         state="normal" if send2trash else "disabled").pack(anchor="w", pady=(6, 0))
 
         ttk.Separator(box).pack(fill="x", pady=6)
-        self.est_text = tk.StringVar()
+        self.est_text = tk.StringVar(value="사진을 받으면 리사이즈 후 예상 용량이\n여기에 표시됩니다.\n\n")
         ttk.Label(box, textvariable=self.est_text, justify="left", width=40,
-                  wraplength=330).pack(anchor="w")
+                  wraplength=400).pack(anchor="w")
 
         self.recv_dir = tk.StringVar(value=str(pick_setting(S, "recv_dir", str(RECEIVED_DIR), lambda v: bool(str(v).strip()))))
         self.out_dir = tk.StringVar(value=str(pick_setting(S, "out_dir", str(DEFAULT_OUT_DIR), lambda v: bool(str(v).strip()))))
@@ -741,7 +757,7 @@ class App(tk.Tk):
     # ---- QR / 서버 ----
     def _update_qr(self):
         url = f"http://{self.ip_var.get()}:{PORT}"
-        self.qr_img = ImageTk.PhotoImage(qrcode.make(url).resize((190, 190)))
+        self.qr_img = ImageTk.PhotoImage(qrcode.make(url).resize((self.qr_px, self.qr_px)))
         self.qr_label.configure(image=self.qr_img)
         self.url_label.configure(text=url)
 
@@ -995,12 +1011,12 @@ class App(tk.Tk):
         self.est_gen += 1
         gen, settings, targets = self.est_gen, self._settings(), self._targets()
         if not targets:
-            self.est_text.set("사진을 받으면 리사이즈 후 예상 용량이\n여기에 표시됩니다.\n\n\n")
+            self.est_text.set("사진을 받으면 리사이즈 후 예상 용량이\n여기에 표시됩니다.\n\n")
             return
         if settings is None:
-            self.est_text.set("설정 값을 확인하세요.\n\n\n\n")
+            self.est_text.set("설정 값을 확인하세요.\n\n\n")
             return
-        self.est_text.set("예상 용량 계산 중...\n\n\n\n")
+        self.est_text.set("예상 용량 계산 중...\n\n\n")
         step = -(-len(targets) // 8)  # 많으면 8장만 샘플링해 비율로 추정
         sample = [(p, self.photos[p].size) for p in targets[::step][:8]]
         total = sum(self.photos[p].size for p in targets)
@@ -1010,7 +1026,7 @@ class App(tk.Tk):
             try:
                 res = [process_image(p, *settings) for p, _ in sample]
             except Exception as e:  # noqa: BLE001
-                self.q.put(("estimate", gen, f"계산 실패: {e}\n\n\n\n"))
+                self.q.put(("estimate", gen, f"계산 실패: {str(e)[:40]}\n\n\n"))
                 return
             orig = sum(s for _, s in sample)
             est = sum(len(r[0]) for r in res)
@@ -1023,7 +1039,7 @@ class App(tk.Tk):
                 f"첫 사진: {ph.width}×{ph.height} → {res[0][2][0]}×{res[0][2][1]}, 약 {fmt_size(len(res[0][0]))}",
                 f"(전체 중 {len(sample)}장 샘플 기준 추정)" if len(sample) < len(targets) else "",
             ]
-            self.q.put(("estimate", gen, "\n".join(lines) + "\n"))
+            self.q.put(("estimate", gen, "\n".join(lines)))
         self.pool.submit(work)
 
     def _on_estimate(self, gen: int, text: str):
