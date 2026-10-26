@@ -44,6 +44,11 @@ RECEIVED_DIR = BASE_DIR / "received"
 DEFAULT_OUT_DIR = BASE_DIR / "resized"
 
 
+def set_received_dir(path: Path):
+    global RECEIVED_DIR
+    RECEIVED_DIR = path
+
+
 
 # ---------------------------------------------------------------- 유틸
 MAC = sys.platform == "darwin"
@@ -326,13 +331,22 @@ SEL_BG, SEL_OUT = "#cfe3ff", "#0071e3"
 MODE_DEFAULT = {"long": 1920, "width": 1920, "percent": 50}
 MODE_UNIT = {"long": "px", "width": "px", "percent": "%"}
 MODE_PRESETS = {"long": (800, 1280, 1920, 2560, 3840), "width": (800, 1280, 1920, 2560, 3840),
-                "percent": (25, 50, 75)}
+                "percent": (10, 25, 50, 75, 100)}
 MODE_RANGE = {"long": (200, 4096), "width": (200, 4096), "percent": (5, 100)}
 TOGGLE_MASK = 0x8 if MAC else 0x4  # macOS: Command, 그 외: Ctrl
 
 
 def shorten(name: str, limit=24) -> str:
     return name if len(name) <= limit else name[:limit // 2] + "…" + name[-(limit // 2 - 2):]
+
+
+def pick_setting(settings: dict, key: str, default, valid=lambda v: True):
+    """설정 파일 값이 없거나 이상하면 기본값을 쓴다."""
+    v = settings.get(key, default)
+    try:
+        return v if valid(v) else default
+    except Exception:  # noqa: BLE001
+        return default
 
 
 class App(tk.Tk):
@@ -370,8 +384,9 @@ class App(tk.Tk):
 
     # ---- 화면 구성 ----
     def _build_ui(self):
-        self.settings = load_settings()
-        self.auto_update = tk.BooleanVar(value=self.settings.get("auto_update", True))
+        S = self.settings = load_settings()
+        self._save_job = None
+        self.auto_update = tk.BooleanVar(value=bool(pick_setting(S, "auto_update", True)))
         menubar = tk.Menu(self)
         um = tk.Menu(menubar, tearoff=False)
         um.add_command(label="업데이트 확인...", command=lambda: self._check_update(True))
@@ -404,15 +419,19 @@ class App(tk.Tk):
 
         box = ttk.LabelFrame(left, text="리사이즈 설정", padding=8)
         box.pack(fill="x")
-        self.mode = tk.StringVar(value="percent")
+        mode0 = pick_setting(S, "mode", "percent", lambda v: v in MODE_DEFAULT)
+        self.mode = tk.StringVar(value=mode0)
         self.mode_values = dict(MODE_DEFAULT)
-        self._prev_mode = "percent"
+        saved_vals = S.get("values") if isinstance(S.get("values"), dict) else {}
+        for m in MODE_DEFAULT:
+            self.mode_values[m] = pick_setting(saved_vals, m, MODE_DEFAULT[m], lambda v: int(v) >= 1)
+        self._prev_mode = mode0
         for text, val in (("비율", "percent"), ("긴 변 기준", "long"), ("가로 기준", "width")):
             ttk.Radiobutton(box, text=text, value=val, variable=self.mode,
                             command=self._on_mode).pack(anchor="w")
 
         vrow = ttk.Frame(box); vrow.pack(fill="x", pady=(6, 0))
-        self.value = tk.IntVar(value=MODE_DEFAULT["percent"])
+        self.value = tk.IntVar(value=int(self.mode_values[mode0]))
         self.spin = ttk.Spinbox(vrow, from_=1, to=20000, textvariable=self.value, width=7)
         self.spin.pack(side="left")
         self.unit = ttk.Label(vrow, text="px", width=3)
@@ -423,46 +442,55 @@ class App(tk.Tk):
 
         row = ttk.Frame(box); row.pack(fill="x", pady=(6, 0))
         ttk.Label(row, text="형식").pack(side="left")
-        self.fmt = tk.StringVar(value="JPEG")
+        self.fmt = tk.StringVar(value=pick_setting(S, "fmt", "JPEG", lambda v: v in ("JPEG", "PNG", "원본 유지")))
         ttk.Combobox(row, textvariable=self.fmt, values=["JPEG", "PNG", "원본 유지"],
                      width=9, state="readonly").pack(side="left", padx=4)
         row = ttk.Frame(box); row.pack(fill="x", pady=4)
         ttk.Label(row, text="JPEG 품질").pack(side="left")
-        self.quality = tk.IntVar(value=85)
+        self.quality = tk.IntVar(value=int(pick_setting(S, "quality", 85, lambda v: 1 <= int(v) <= 100)))
         ttk.Spinbox(row, from_=1, to=100, textvariable=self.quality, width=5).pack(side="left", padx=4)
         row = ttk.Frame(box); row.pack(fill="x")
-        self.limit_on = tk.BooleanVar(value=False)
+        self.limit_on = tk.BooleanVar(value=bool(pick_setting(S, "limit_on", False)))
         ttk.Checkbutton(row, text="용량 제한 (KB)", variable=self.limit_on).pack(side="left")
-        self.limit_kb = tk.IntVar(value=500)
+        self.limit_kb = tk.IntVar(value=int(pick_setting(S, "limit_kb", 500, lambda v: int(v) >= 1)))
         ttk.Spinbox(row, from_=10, to=50000, increment=50, textvariable=self.limit_kb,
                     width=7).pack(side="left", padx=4)
 
-        self.delete_orig = tk.BooleanVar(value=bool(self.settings.get("delete_original")) and send2trash is not None)
+        self.delete_orig = tk.BooleanVar(value=bool(S.get("delete_original")) and send2trash is not None)
         ttk.Checkbutton(box, text="리사이즈 후 원본을 휴지통으로 이동", variable=self.delete_orig,
-                        command=self._save_delete_orig,
                         state="normal" if send2trash else "disabled").pack(anchor="w", pady=(6, 0))
 
         ttk.Separator(box).pack(fill="x", pady=6)
         self.est_text = tk.StringVar()
-        ttk.Label(box, textvariable=self.est_text, justify="left", width=40).pack(anchor="w")
+        ttk.Label(box, textvariable=self.est_text, justify="left", width=40,
+                  wraplength=330).pack(anchor="w")
 
-        ttk.Label(left, text="저장 폴더").pack(anchor="w", pady=(8, 0))
-        self.out_dir = tk.StringVar(value=str(DEFAULT_OUT_DIR))
-        ttk.Entry(left, textvariable=self.out_dir, width=34).pack(fill="x")
-        row = ttk.Frame(left); row.pack(fill="x")
-        ttk.Button(row, text="폴더 변경", command=self._pick_dir).pack(side="right")
-        ttk.Button(row, text="폴더 열기",
-                   command=lambda: open_folder(Path(self.out_dir.get()))).pack(side="right", padx=4)
+        self.recv_dir = tk.StringVar(value=str(pick_setting(S, "recv_dir", str(RECEIVED_DIR), lambda v: bool(str(v).strip()))))
+        self.out_dir = tk.StringVar(value=str(pick_setting(S, "out_dir", str(DEFAULT_OUT_DIR), lambda v: bool(str(v).strip()))))
+        set_received_dir(Path(self.recv_dir.get()))
+        folders = ttk.LabelFrame(left, text="폴더", padding=8)
+        folders.pack(fill="x", pady=(8, 0))
+        for r, (label, var) in enumerate((("원본 폴더", self.recv_dir), ("리사이즈 폴더", self.out_dir))):
+            ttk.Label(folders, text=label).grid(row=r * 2, column=0, columnspan=3, sticky="w",
+                                                pady=(4 if r else 0, 0))
+            ent = ttk.Entry(folders, textvariable=var, width=22, state="readonly")
+            ent.grid(row=r * 2 + 1, column=0, sticky="ew")
+            ent.xview_moveto(1.0)  # 긴 경로는 끝부분(폴더명)이 보이게
+            ttk.Button(folders, text="열기", width=4,
+                       command=lambda v=var: open_folder(Path(v.get()))).grid(row=r * 2 + 1, column=1, padx=(4, 0))
+            ttk.Button(folders, text="변경", width=4,
+                       command=lambda v=var: self._pick_dir(v)).grid(row=r * 2 + 1, column=2, padx=(4, 0))
+        folders.columnconfigure(0, weight=1)
 
         right = ttk.Frame(self, padding=(4, 8, 12, 8))
         right.pack(side="left", fill="both", expand=True)
         bar = ttk.Frame(right); bar.pack(fill="x")
         ttk.Label(bar, text="받은 사진").pack(side="left")
-        self.view = tk.StringVar(value="grid")
+        self.view = tk.StringVar(value=pick_setting(S, "view", "grid", lambda v: v in ("grid", "list")))
         for text, val in (("▦ 그리드", "grid"), ("☰ 리스트", "list")):
             ttk.Radiobutton(bar, text=text, value=val, variable=self.view, style="Toolbutton",
                             command=self._show_view).pack(side="left", padx=(8 if val == "grid" else 0, 0))
-        self.thumb_size = int(self.settings.get("thumb_size", 160))
+        self.thumb_size = int(pick_setting(S, "thumb_size", 160, lambda v: int(v) > 0))
         self.thumb_size = min(THUMB_MAX, max(THUMB_MIN, self.thumb_size))
         self.cell_w, self.cell_h = self.thumb_size + 16, self.thumb_size + 44
         self.size_frame = ttk.Frame(bar)
@@ -473,10 +501,10 @@ class App(tk.Tk):
         self.size_scale.pack(side="left", padx=2)
         ttk.Label(self.size_frame, text="▣", foreground="#888").pack(side="left")
         self.size_scale.bind("<ButtonRelease-1>", lambda _e: self._save_thumb_size())
-        self.sort_desc = tk.BooleanVar(value=True)
+        self.sort_desc = tk.BooleanVar(value=bool(pick_setting(S, "sort_desc", True)))
         self.order_btn = ttk.Button(bar, width=9, command=self._toggle_order)
         self.order_btn.pack(side="right")
-        self.sort_key = tk.StringVar(value="생성일")
+        self.sort_key = tk.StringVar(value=pick_setting(S, "sort_key", "생성일", lambda v: v in ("생성일", "파일 이름")))
         sc = ttk.Combobox(bar, textvariable=self.sort_key, values=["생성일", "파일 이름"],
                           width=9, state="readonly")
         sc.pack(side="right", padx=4)
@@ -499,6 +527,13 @@ class App(tk.Tk):
 
         for var in (self.mode, self.value, self.fmt, self.quality, self.limit_on, self.limit_kb):
             var.trace_add("write", lambda *_: self._schedule_estimate())
+        for var in (self.mode, self.value, self.fmt, self.quality, self.limit_on, self.limit_kb,
+                    self.delete_orig, self.out_dir, self.recv_dir, self.view, self.sort_key,
+                    self.sort_desc, self.auto_update):
+            var.trace_add("write", lambda *_: self._schedule_save())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if MAC:  # Cmd+Q 로 끝낼 때도 저장
+            self.createcommand("tk::mac::Quit", self._on_close)
         self.value.trace_add("write", lambda *_: self._sync_scale())
         self._on_mode()
         self._refresh_order_btn()
@@ -576,8 +611,39 @@ class App(tk.Tk):
         self.canvas.yview_moveto(top)
 
     def _save_thumb_size(self):
-        self.settings["thumb_size"] = self.thumb_size
+        self._schedule_save()
+
+    def _schedule_save(self):
+        if self._save_job:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(500, self._save_all)
+
+    def _save_all(self):
+        """창 상태가 아닌 '설정'을 모두 파일에 저장한다 (다음 실행 때 그대로 복원)."""
+        self._save_job = None
+        values = dict(self.mode_values)
+        try:
+            values[self.mode.get()] = max(1, int(self.value.get()))
+        except (tk.TclError, ValueError):
+            pass  # 입력 중인 빈 칸이면 마지막으로 저장된 값을 유지
+        def num(var, default):
+            try:
+                return int(var.get())
+            except (tk.TclError, ValueError):
+                return default
+        self.settings.update(
+            mode=self.mode.get(), values=values, fmt=self.fmt.get(),
+            quality=num(self.quality, 85), limit_on=self.limit_on.get(),
+            limit_kb=num(self.limit_kb, 500), delete_original=self.delete_orig.get(),
+            out_dir=self.out_dir.get(), recv_dir=self.recv_dir.get(),
+            view=self.view.get(), sort_key=self.sort_key.get(), sort_desc=self.sort_desc.get(),
+            thumb_size=self.thumb_size, auto_update=self.auto_update.get())
         save_settings(self.settings)
+
+    def _on_close(self):
+        self._closing = True
+        self._save_all()
+        self.destroy()
 
     def _has_event(self, seq: str) -> bool:
         try:  # Tk 8.6에는 TouchpadScroll 이벤트가 없다
@@ -898,10 +964,13 @@ class App(tk.Tk):
         self.scale.set(v)
         self._syncing_scale = False
 
-    def _pick_dir(self):
-        d = filedialog.askdirectory()
+    def _pick_dir(self, var: tk.StringVar):
+        d = filedialog.askdirectory(initialdir=var.get() if Path(var.get()).exists() else None)
         if d:
-            self.out_dir.set(d)
+            var.set(d)
+            if var is self.recv_dir:  # 이후 받는 사진부터 새 폴더에 저장 (기존 파일은 옮기지 않는다)
+                set_received_dir(Path(d))
+                self.status.set(f"이후 받는 사진은 {d} 에 저장됩니다")
 
     def _settings(self):
         """현재 설정을 (mode, value, fmt, quality, max_kb)로 반환. 입력이 비정상이면 None."""
@@ -1023,13 +1092,8 @@ class App(tk.Tk):
     def _fmt_built(ts) -> str:
         return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M") if ts else "알 수 없음"
 
-    def _save_delete_orig(self):
-        self.settings["delete_original"] = self.delete_orig.get()
-        save_settings(self.settings)
-
     def _save_auto_update(self):
-        self.settings["auto_update"] = self.auto_update.get()
-        save_settings(self.settings)
+        self._schedule_save()
 
     def _about(self):
         messagebox.showinfo("버전 정보", f"PhotoReceiver {__version__}\n빌드: {updater.COMMIT} ({self._fmt_built(updater.BUILT)})\n"
@@ -1097,6 +1161,7 @@ class App(tk.Tk):
 
     def _on_update_exit(self):
         self._closing = True
+        self._save_all()
         self.destroy()
 
 
